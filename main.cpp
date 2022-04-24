@@ -70,6 +70,12 @@ struct OS_Memory{
   SizeU reserve;
 };
 
+function B32
+os_memory_initialized(OS_Memory *m){
+  B32 result = m->p != 0;
+  return result;
+}
+
 function OS_Memory
 os_reserve(SizeU size){
   OS_Memory result = {};
@@ -103,6 +109,16 @@ os_decommit(OS_Memory *m, SizeU size){
     B32 result = VirtualFree(p, size, MEM_DECOMMIT);
     assert_msg(result, "Failed to deallocate memory");
   }
+}
+
+function void
+os_release(OS_Memory *m){
+  BOOL result = VirtualFree(m->p, 0, MEM_RELEASE);
+  assert_msg(result, "Failed to release virtual memory");
+  
+  m->p = 0;
+  m->reserve = 0;
+  m->commit = 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -188,14 +204,56 @@ arena_clear(Arena *arena){
   arena_pop_to_pos(arena, 0);
 }
 
+function void
+alloc_clear(Base_Allocator *alloc){
+  alloc->proc(alloc, AK_Clear, 0, 0);
+}
+
+function void *
+alloc_resize(Base_Allocator *alloc, void *p, SizeU new_size){
+  return alloc->proc(alloc, AK_Resize, new_size, p);
+}
+
+#define alloc_array(a,T,c) (T *)allocate(a,sizeof(T)*(c))
+function void *
+allocate(Base_Allocator *alloc, SizeU size){
+  return alloc->proc(alloc, AK_Alloc, size, 0);
+}
+//-----------------------------------------------------------------------------
+// Benchmark tool
+//-----------------------------------------------------------------------------
+static struct Test_Time{
+  const char *name;
+  U64 time;
+  U64 count;
+} global_test[16];
+
+struct Benchmark_Scope{
+  U64 begin;
+  const char *name;
+  U64 i;
+  Benchmark_Scope(U64 i, const char *name){
+    begin = __rdtsc();
+    this->i = i;
+    this->name = name;
+  }
+  ~Benchmark_Scope(){
+    global_test[i].time += __rdtsc() - begin;
+    global_test[i].name = name;
+    global_test[i].count++;
+  }
+};
+
 function void *
 arena_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU size, void *old_pointer){
   Arena *arena = (Arena *)allocator;
   switch(kind){
     case AK_Alloc:{
+      Benchmark_Scope(0, "arena_push_size");
       return arena_push_size(arena, size);
     } break;
     case AK_Resize:{
+      Benchmark_Scope(1, "arena_push_resize");
       if(old_pointer == arena->last_allocation){
         SizeU arena_base = (SizeU)(arena->memory.p + arena->len);
         SizeU allocation_address = (SizeU)arena->last_allocation;
@@ -221,22 +279,6 @@ arena_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU size
   }
 }
 
-function void
-alloc_clear(Base_Allocator *alloc){
-  alloc->proc(alloc, AK_Clear, 0, 0);
-}
-
-function void *
-alloc_resize(Base_Allocator *alloc, void *p, SizeU new_size){
-  return alloc->proc(alloc, AK_Resize, new_size, p);
-}
-
-#define alloc_array(a,T,c) (T *)allocate(a,sizeof(T)*(c))
-function void *
-allocate(Base_Allocator *alloc, SizeU size){
-  return alloc->proc(alloc, AK_Alloc, size, 0);
-}
-
 //-----------------------------------------------------------------------------
 // Thread local memory block fetcher
 //-----------------------------------------------------------------------------
@@ -251,6 +293,9 @@ get_memory_block(){
   assert_msg(thread_ctx.first_free,"No free memory blocks on arena");
   Arena *free = thread_ctx.first_free;
   thread_ctx.first_free = thread_ctx.first_free->next;
+  if(!os_memory_initialized(&free->memory)){
+    arena_init(free, mib(128), 8, 0);
+  }
   return free;
 }
 
@@ -298,8 +343,7 @@ struct Array{
   }
   
   void clear(){
-    // free_memory_block(allocator); // arena only
-    //alloc_clear(allocator);
+    free_memory_block(allocator); // arena only
   }
   T &operator[](SizeU i){return data[i];}
   T *begin(){return data;}
@@ -327,11 +371,13 @@ os_heap_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU si
   auto *os_heap = (OS_Heap_Allocator *)allocator;
   switch(kind){
     case AK_Alloc:{
+      Benchmark_Scope(2, "heap_alloc");
       void *result = HeapAlloc(os_heap->heap, 0, size);
       assert(result);
       return result;
     } break;
     case AK_Resize:{
+      Benchmark_Scope(3, "heap_realloc");
       void *result = HeapReAlloc(os_heap->heap, 0, old_pointer, size);
       assert(result);
       return result;
@@ -341,7 +387,7 @@ os_heap_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU si
       return 0;
     } break;
     case AK_Free:{
-      HeapFree(os_heap->heap, 0, old_pointer);
+      //HeapFree(os_heap->heap, 0, old_pointer);
       return 0;
     } break;
   }
@@ -363,9 +409,11 @@ function void *
 crt_malloc_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU size, void *old_pointer){
   switch(kind){
     case AK_Alloc:{
+      Benchmark_Scope(4, "malloc");
       return malloc(size);
     } break;
     case AK_Resize:{
+      Benchmark_Scope(5, "realloc");
       return realloc(old_pointer, size);
     } break;
     case AK_Clear:{
@@ -382,7 +430,6 @@ crt_malloc_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU
 int main(){
   for(SizeU i = 0; i < buff_cap(thread_ctx.blocks); i++){
     Arena *a = thread_ctx.blocks + i;
-    arena_init(a, mib(128), 8, 0);
     a->next = thread_ctx.first_free;
     thread_ctx.first_free = a;
   }
@@ -399,7 +446,7 @@ int main(){
     assert(arena.len == 0);
     assert(arena.decommit_line = kib(4));
     assert(arena.memory.commit = kib(4));
-    // Leak arena~
+    os_release(&arena.memory);
   }
   
   constexpr int array_items = 10000;
@@ -417,10 +464,12 @@ int main(){
     printf("Arena time: %zu\n", end - begin);
   }
   
-  
   OS_Heap_Allocator heap = {};
   heap.init();
   {
+    for(int i = 0; i < 100000; i++){
+      allocate(&heap, 100);
+    }
     U64 begin = __rdtsc();
     Array<int> array = {};
     array.allocator = &heap;
@@ -430,15 +479,17 @@ int main(){
     for(int i = 0; i < array_items; i++){
       assert(array[i] == i);
     }
-    array.clear();
+    //array.clear();
     U64 end = __rdtsc();
     printf("OS Heap time: %zu\n", end - begin);
+    
   }
-  
-  
   
   CRT_Malloc_Allocator crt;
   {
+    for(int i = 0; i < 100000; i++){
+      allocate(&crt, 100);
+    }
     U64 begin = __rdtsc();
     Array<int> array = {};
     array.allocator = &crt;
@@ -448,8 +499,16 @@ int main(){
     for(int i = 0; i < array_items; i++){
       assert(array[i] == i);
     }
-    array.clear();
+    //array.clear();
     U64 end = __rdtsc();
     printf("CRT Malloc time: %zu\n", end - begin);
   }
+  
+  for(int i = 0; i < 6; i++){
+    U64 t = global_test[i].time / global_test[i].count;
+    printf("Name: %s Hits: %zu TotalTime: %zu AverageTime: %zu\n",
+           global_test[i].name, global_test[i].count,
+           global_test[i].time, t);
+  }
+  getc(stdin);
 }
