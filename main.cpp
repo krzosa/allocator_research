@@ -22,13 +22,9 @@ typedef int64_t  B64;
 #define assert_msg(x,...) assert(x)
 #define buff_cap(x) (sizeof((x))/sizeof((x)[0]))
 
-constexpr SizeU page_size = 4096;
-struct OS_Memory{
-  U8 *p;
-  SizeU commit;
-  SizeU reserve;
-};
-
+//-----------------------------------------------------------------------------
+// Utilities
+//-----------------------------------------------------------------------------
 function B32
 is_power_of_2(SizeU x){
   SizeU result = (x & (x - 1)) == 0;
@@ -63,6 +59,16 @@ clamp_bot(SizeU bot, SizeU val){
   if(val<bot) return bot;
   return val;
 }
+
+//-----------------------------------------------------------------------------
+// OS Virtual memory operations
+//-----------------------------------------------------------------------------
+constexpr SizeU page_size = 4096;
+struct OS_Memory{
+  U8 *p;
+  SizeU commit;
+  SizeU reserve;
+};
 
 function OS_Memory
 os_reserve(SizeU size){
@@ -99,6 +105,9 @@ os_decommit(OS_Memory *m, SizeU size){
   }
 }
 
+//-----------------------------------------------------------------------------
+// Base Allocator
+//-----------------------------------------------------------------------------
 enum Allocation_Kind{
   AK_Alloc,
   AK_Free,
@@ -112,6 +121,9 @@ struct Base_Allocator{
   Allocator_Proc *proc;
 };
 
+//-----------------------------------------------------------------------------
+// Arena allocator
+//-----------------------------------------------------------------------------
 struct Arena:Base_Allocator{
   Arena *next;
   OS_Memory memory;
@@ -135,7 +147,7 @@ arena_init(Arena *arena, SizeU reserve, U32 alignment, U32 decommit_line){
 constexpr SizeU default_reserve_size = gib(1);
 constexpr SizeU default_alignment = 8;
 constexpr SizeU default_decommit_line = mib(1);
-constexpr SizeU default_commit_size = mib(128);
+constexpr SizeU default_commit_size = mib(1);
 #define arena_push_array(a,T,c) (T*)arena_push_size((a), sizeof(T)*(c))
 #define arena_push_struct(a,T) arena_push_array(a,T,1)
 
@@ -225,6 +237,9 @@ allocate(Base_Allocator *alloc, SizeU size){
   return alloc->proc(alloc, AK_Alloc, size, 0);
 }
 
+//-----------------------------------------------------------------------------
+// Thread local memory block fetcher
+//-----------------------------------------------------------------------------
 struct ThreadCtx{
   Arena blocks[128];
   Arena *first_free;
@@ -253,6 +268,9 @@ max(SizeU a, SizeU b){
   return b;
 }
 
+//-----------------------------------------------------------------------------
+// Array
+//-----------------------------------------------------------------------------
 template<class T>
 struct Array{
   Base_Allocator *allocator;
@@ -384,7 +402,7 @@ int main(){
     // Leak arena~
   }
   
-  constexpr int array_items = 1000000;
+  constexpr int array_items = 10000;
   {
     U64 begin = __rdtsc();
     Array<int> array = {};
