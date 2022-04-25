@@ -1,125 +1,30 @@
-#include <stdio.h>
-#include <stdint.h>
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#define function static
-typedef uint64_t SizeU;
-typedef int64_t  SizeI;
-typedef uint8_t  U8;
-typedef uint32_t U32;
-typedef uint64_t U64;
-typedef int8_t   S8;
-typedef int32_t  S32;
-typedef int64_t  S64;
-typedef int8_t   B8;
-typedef int32_t  B32;
-typedef int64_t  B64;
-#define kib(x) ((x)*1024llu)
-#define mib(x) (kib(x)*1024llu)
-#define gib(x) (mib(x)*1024llu)
-#define assert(x) do{ if(!(x)) __debugbreak(); } while(0)
-#define assert_msg(x,...) assert(x)
-#define buff_cap(x) (sizeof((x))/sizeof((x)[0]))
+#include "types.cpp"
+#include "os.cpp"
 
 //-----------------------------------------------------------------------------
-// Utilities
+// Benchmark tool
 //-----------------------------------------------------------------------------
-function B32
-is_power_of_2(SizeU x){
-  SizeU result = (x & (x - 1)) == 0;
-  return result;
-}
+global struct Test_Time{
+  const char *name;
+  U64 time;
+  U64 count;
+} global_test[16];
 
-function SizeU
-get_align_offset(SizeU x, SizeU powerof2){
-  assert(is_power_of_2(powerof2));
-  SizeU not_pow2 = x & (powerof2 - 1);
-  if(not_pow2){
-    SizeU result = (powerof2 - not_pow2);
-    return result;
+struct Benchmark_Scope{
+  U64 begin;
+  const char *name;
+  U64 i;
+  Benchmark_Scope(U64 i, const char *name){
+    begin = __rdtsc();
+    this->i = i;
+    this->name = name;
   }
-  return 0;
-}
-
-function SizeU
-align_up(SizeU x, SizeU pow2){
-  SizeU result = x + get_align_offset(x, pow2);
-  return result;
-}
-
-function SizeU
-clamp_top(SizeU val, SizeU top){
-  if(val>top) return top;
-  return val;
-}
-
-function SizeU
-clamp_bot(SizeU bot, SizeU val){
-  if(val<bot) return bot;
-  return val;
-}
-
-//-----------------------------------------------------------------------------
-// OS Virtual memory operations
-//-----------------------------------------------------------------------------
-constexpr SizeU page_size = 4096;
-struct OS_Memory{
-  U8 *p;
-  SizeU commit;
-  SizeU reserve;
+  ~Benchmark_Scope(){
+    global_test[i].time += __rdtsc() - begin;
+    global_test[i].name = name;
+    global_test[i].count++;
+  }
 };
-
-function B32
-os_memory_initialized(OS_Memory *m){
-  B32 result = m->p != 0;
-  return result;
-}
-
-function OS_Memory
-os_reserve(SizeU size){
-  OS_Memory result = {};
-  result.reserve = align_up(size, page_size);
-  result.p = (U8 *)VirtualAlloc(0, size, MEM_RESERVE, PAGE_READWRITE);
-  assert_msg(result.p, "Failed to reserve memory");
-  return result;
-}
-
-function void
-os_commit(OS_Memory *m, SizeU size){
-  size = align_up(size, page_size);
-  SizeU new_commit = m->commit + size;
-  new_commit = clamp_top(new_commit, m->reserve);
-  SizeU commit_size = new_commit - m->commit;
-  assert_msg(commit_size, "Run out of reserved memory");
-  if(commit_size){
-    void *p = VirtualAlloc(m->p + m->commit, commit_size, MEM_COMMIT, PAGE_READWRITE);
-    assert_msg(p, "Failed to commit memory");
-    m->commit = new_commit;
-  }
-}
-
-function void
-os_decommit(OS_Memory *m, SizeU size){
-  size = align_up(size, page_size);
-  size = clamp_top(size, m->commit);
-  if(size){
-    m->commit -= size;
-    U8 *p = m->p + m->commit;
-    B32 result = VirtualFree(p, size, MEM_DECOMMIT);
-    assert_msg(result, "Failed to deallocate memory");
-  }
-}
-
-function void
-os_release(OS_Memory *m){
-  BOOL result = VirtualFree(m->p, 0, MEM_RELEASE);
-  assert_msg(result, "Failed to release virtual memory");
-  
-  m->p = 0;
-  m->reserve = 0;
-  m->commit = 0;
-}
 
 //-----------------------------------------------------------------------------
 // Base Allocator
@@ -150,6 +55,14 @@ struct Arena:Base_Allocator{
 };
 function void *arena_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU size, void *old_pointer);
 
+//-----------------------------------------------------------------------------
+// Arena allocator
+//-----------------------------------------------------------------------------
+constexpr SizeU default_reserve_size = gib(1);
+constexpr SizeU default_alignment = 8;
+constexpr SizeU default_decommit_line = mib(1);
+constexpr SizeU default_commit_size = mib(1);
+
 function void
 arena_init(Arena *arena, SizeU reserve, U32 alignment, U32 decommit_line){
   arena->memory = os_reserve(reserve);
@@ -159,13 +72,6 @@ arena_init(Arena *arena, SizeU reserve, U32 alignment, U32 decommit_line){
   arena->decommit_line = decommit_line;
   arena->len = 0;
 }
-
-constexpr SizeU default_reserve_size = gib(1);
-constexpr SizeU default_alignment = 8;
-constexpr SizeU default_decommit_line = mib(1);
-constexpr SizeU default_commit_size = mib(1);
-#define arena_push_array(a,T,c) (T*)arena_push_size((a), sizeof(T)*(c))
-#define arena_push_struct(a,T) arena_push_array(a,T,1)
 
 function void
 arena_try_resizing(Arena *arena, SizeU size){
@@ -178,8 +84,9 @@ arena_try_resizing(Arena *arena, SizeU size){
   }
 }
 
-function void *
-arena_push_size(Arena *arena, SizeU size){
+#define arena_push_array(a,T,c) (T*)arena_push_size((a), sizeof(T)*(c))
+#define arena_push_struct(a,T) arena_push_array(a,T,1)
+function void *arena_push_size(Arena *arena, SizeU size){
   arena_try_resizing(arena, size);
   assert(arena->len + size < arena->memory.reserve);
   arena->len += get_align_offset((SizeU)arena->memory.p, arena->alignment);
@@ -209,40 +116,20 @@ alloc_clear(Base_Allocator *alloc){
   alloc->proc(alloc, AK_Clear, 0, 0);
 }
 
+function void
+alloc_free(Base_Allocator *alloc, void *pointer){
+  alloc->proc(alloc, AK_Free, 0, pointer);
+}
+
 function void *
 alloc_resize(Base_Allocator *alloc, void *p, SizeU new_size){
   return alloc->proc(alloc, AK_Resize, new_size, p);
 }
 
 #define alloc_array(a,T,c) (T *)allocate(a,sizeof(T)*(c))
-function void *
-allocate(Base_Allocator *alloc, SizeU size){
+function void *allocate(Base_Allocator *alloc, SizeU size){
   return alloc->proc(alloc, AK_Alloc, size, 0);
 }
-//-----------------------------------------------------------------------------
-// Benchmark tool
-//-----------------------------------------------------------------------------
-static struct Test_Time{
-  const char *name;
-  U64 time;
-  U64 count;
-} global_test[16];
-
-struct Benchmark_Scope{
-  U64 begin;
-  const char *name;
-  U64 i;
-  Benchmark_Scope(U64 i, const char *name){
-    begin = __rdtsc();
-    this->i = i;
-    this->name = name;
-  }
-  ~Benchmark_Scope(){
-    global_test[i].time += __rdtsc() - begin;
-    global_test[i].name = name;
-    global_test[i].count++;
-  }
-};
 
 function void *
 arena_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU size, void *old_pointer){
@@ -280,7 +167,7 @@ arena_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU size
 }
 
 //-----------------------------------------------------------------------------
-// Thread local memory block fetcher
+// Thread local block fetcher
 //-----------------------------------------------------------------------------
 struct ThreadCtx{
   Arena blocks[128];
@@ -342,9 +229,7 @@ struct Array{
     *slot = e;
   }
   
-  void clear(){
-    free_memory_block(allocator); // arena only
-  }
+  void clear(){free_memory_block(allocator);}
   T &operator[](SizeU i){return data[i];}
   T *begin(){return data;}
   T *end(){return data+len;}
@@ -387,7 +272,7 @@ os_heap_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU si
       return 0;
     } break;
     case AK_Free:{
-      //HeapFree(os_heap->heap, 0, old_pointer);
+      HeapFree(os_heap->heap, 0, old_pointer);
       return 0;
     } break;
   }
@@ -427,6 +312,7 @@ crt_malloc_allocator_proc(Base_Allocator *allocator, Allocation_Kind kind, SizeU
   }
 }
 
+#define ASSERTS 1
 int main(){
   for(SizeU i = 0; i < buff_cap(thread_ctx.blocks); i++){
     Arena *a = thread_ctx.blocks + i;
@@ -434,77 +320,65 @@ int main(){
     thread_ctx.first_free = a;
   }
   
-  {
-    Arena arena = {};
-    arena_init(&arena, kib(8), 8, kib(4));
-    int *a = arena_push_struct(&arena, int);
-    *a = 10;
-    assert(arena.memory.commit == kib(8));
-    void *p = arena_push_size(&arena, kib(3));
-    arena_push_size(&arena, kib(3));
-    arena_clear(&arena);
-    assert(arena.len == 0);
-    assert(arena.decommit_line = kib(4));
-    assert(arena.memory.commit = kib(4));
-    os_release(&arena.memory);
-  }
-  
+  constexpr int iters = 1000;
   constexpr int array_items = 10000;
-  {
-    U64 begin = __rdtsc();
+  for(int i = 0; i < iters; i++){
+    Benchmark_Scope scope(8, "Arena array");
     Array<int> array = {};
     for(int i = 0; i < array_items; i++){
       array.push(i);
     }
+#if ASSERTS
     for(int i = 0; i < array_items; i++){
       assert(array[i] == i);
     }
+#endif
     array.clear();
-    U64 end = __rdtsc();
-    printf("Arena time: %zu\n", end - begin);
   }
   
   OS_Heap_Allocator heap = {};
   heap.init();
-  {
-    for(int i = 0; i < 100000; i++){
-      allocate(&heap, 100);
-    }
-    U64 begin = __rdtsc();
+  for(int i = 0; i < iters; i++){
+    Benchmark_Scope scope(7, "OS Heap array");
     Array<int> array = {};
     array.allocator = &heap;
     for(int i = 0; i < array_items; i++){
       array.push(i);
     }
+#if ASSERTS
     for(int i = 0; i < array_items; i++){
       assert(array[i] == i);
     }
+#endif
     //array.clear();
-    U64 end = __rdtsc();
-    printf("OS Heap time: %zu\n", end - begin);
-    
+    alloc_free(&heap, array.data);
   }
   
   CRT_Malloc_Allocator crt;
-  {
-    for(int i = 0; i < 100000; i++){
-      allocate(&crt, 100);
-    }
-    U64 begin = __rdtsc();
+  for(int i = 0; i < iters; i++){
+    Benchmark_Scope scope(6, "CRT Array");
     Array<int> array = {};
     array.allocator = &crt;
     for(int i = 0; i < array_items; i++){
       array.push(i);
     }
+#if ASSERTS
     for(int i = 0; i < array_items; i++){
       assert(array[i] == i);
     }
+#endif
     //array.clear();
-    U64 end = __rdtsc();
-    printf("CRT Malloc time: %zu\n", end - begin);
+    alloc_free(&crt, array.data);
   }
   
-  for(int i = 0; i < 6; i++){
+  printf("====== Arena stats =======\n");
+  printf("default_reserve_size %zu\n", default_reserve_size);
+  printf("default_alignment %zu\n", default_alignment);
+  printf("default_decommit_line %zu\n", default_decommit_line);
+  printf("default_commit_size %zu\n", default_commit_size);
+  
+  printf("\n");
+  for(int i = 0; i < 9; i++){
     U64 t = global_test[i].time / global_test[i].count;
     printf("Name: %s Hits: %zu TotalTime: %zu AverageTime: %zu\n",
            global_test[i].name, global_test[i].count,
